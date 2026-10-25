@@ -2,7 +2,6 @@ import logging
 
 import numpy as np
 from scipy.optimize import least_squares, minimize, fmin
-from scipy.signal import find_peaks
 
 
 logger = logging.getLogger(__name__)
@@ -62,6 +61,9 @@ def fit_double_lorentz(x, y, bounds_w0=None, bounds_fwhm=None):
 
     # We run peak finding to get a good guess of the peak positions
     # and use the two peaks with the highest prominence.
+    # Imported here: it is only needed for multi-peak fits, and a lazy
+    # import keeps the worker start-up fast.
+    from scipy.signal import find_peaks
     peaks, properties = find_peaks(y, prominence=1)
     idx = np.argsort(properties['prominences'])[::-1]
 
@@ -172,6 +174,9 @@ def fit_quadruple_lorentz(x, y, bounds_w0=None, bounds_fwhm=None):
 
     # We run peak finding to get a good guess of the peak positions
     # and use the four peaks with the highest prominence.
+    # Imported here: it is only needed for multi-peak fits, and a lazy
+    # import keeps the worker start-up fast.
+    from scipy.signal import find_peaks
     peaks, properties = find_peaks(y, prominence=1)
     idx = np.argsort(properties['prominences'])[::-1]
 

@@ -1,3 +1,7 @@
+## unreleased
+### Added
+- feat(evaluation): fit the measurement points in parallel worker processes
+
 ## 0.12.3 - 2026-06-23
 ### Fixed
 - fix(fits): ignore NaN values when fitting #201
