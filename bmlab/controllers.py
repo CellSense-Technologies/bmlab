@@ -1,4 +1,7 @@
+import contextlib
 import logging
+import threading
+import time
 
 import numpy as np
 from scipy.signal import medfilt2d, find_peaks
@@ -8,7 +11,11 @@ from skimage.morphology import closing, disk
 from math import floor
 
 from bmlab import Session
+from bmlab import parallel_fit
+from bmlab.evaluation_run import RunSuperseded, evaluation_runs
 from bmlab.fits import fit_vipa, VIPA, fit_lorentz_region
+from bmlab import point_fit
+from bmlab.point_fit import PointFitSettings, fit_point
 from bmlab.image import extract_lines_along_arc, find_max_in_radius
 from bmlab.export import FluorescenceExport, \
     FluorescenceCombinedExport, BrillouinExport
@@ -135,7 +142,98 @@ class ExtractionController(object):
                / np.sqrt((line1[1] - line0[1])**2 + (line1[0] - line0[0])**2)
 
 
+class EvaluationSnapshot(object):
+    """
+    Measurement metadata of the current repetition, read once for
+    a single evaluation run.
+
+    The snapshot holds its own repetition wrapper, which is created for
+    this run only and never handed out. It therefore shares no state with
+    the wrappers and position arrays that the GUI obtains through
+    ``Session.get_payload_positions``. The snapshot belongs to the
+    evaluation run that created it and is dropped when that run ends.
+    """
+
+    def __init__(self, session):
+        """
+        Only the image keys and the resolution are read here. The time
+        and exposure of an image are read when they are first needed and
+        then kept. Reading them for all images at the start would delay
+        the first fits on large scans by seconds.
+        """
+        repetition = session.current_repetition()
+        if repetition is None:
+            raise ValueError('No repetition selected')
+        self._session = session
+        self._payload = repetition.payload
+        self.image_keys = self._payload.image_keys(sort_by_time=True)
+        self.resolution = self._payload.resolution
+        self._times = {}
+        self._exposures = {}
+
+    def get_time(self, image_key):
+        if image_key not in self._times:
+            self._times[image_key] = self._payload.get_time(image_key)
+        return self._times[image_key]
+
+    def get_exposure(self, image_key):
+        if image_key not in self._exposures:
+            self._exposures[image_key] = self._payload.get_exposure(image_key)
+        return self._exposures[image_key]
+
+    def get_image(self, image_key):
+        imgs = self._payload.get_image(image_key)
+        if imgs is None:
+            return None
+        # The orientation can be changed by the user, so we apply
+        # the current one like Session.get_payload_image does.
+        return self._session.orientation.apply(imgs)
+
+
+class _PerThread(object):
+    """
+    An attribute whose value belongs to one controller and one thread
+    (default None). A run keeps its state in such attributes, so two
+    runs which share a controller, one in each thread, do not
+    see or reset each other's state.
+    """
+
+    def __set_name__(self, owner, name):
+        self.name = name
+
+    @staticmethod
+    def _local(instance):
+        local = instance.__dict__.get('_per_thread')
+        if local is None:
+            local = instance.__dict__.setdefault(
+                '_per_thread', threading.local())
+        return local
+
+    def __get__(self, instance, owner=None):
+        if instance is None:
+            return None
+        return getattr(self._local(instance), self.name, None)
+
+    def __set__(self, instance, value):
+        setattr(self._local(instance), self.name, value)
+
+
 class ImageController(object):
+
+    # Metadata snapshot of the evaluation run in progress, if any.
+    # Only EvaluationController.evaluate sets it.
+    _snapshot = _PerThread()
+    # The evaluation run in progress (bmlab.evaluation_run), if any.
+    # Only EvaluationController.evaluate sets it.
+    _run = _PerThread()
+
+    def _writing(self):
+        """
+        Context for writes into shared state. Inside an evaluation run
+        it raises RunSuperseded if a newer run has started.
+        """
+        run = self._run
+        return contextlib.nullcontext() if run is None else run.writing()
 
     def __init__(self, model, get_image, get_time, get_exposure):
         self.session = Session.get_instance()
@@ -148,12 +246,18 @@ class ImageController(object):
         em = self.session.extraction_model()
         if not em:
             return None, None, None
-        time = self.get_time(image_key)
+        get_time, get_exposure, get_image = \
+            self.get_time, self.get_exposure, self.get_image
+        if self._snapshot is not None:
+            get_time = self._snapshot.get_time
+            get_exposure = self._snapshot.get_exposure
+            get_image = self._snapshot.get_image
+        time = get_time(image_key)
         arc = em.get_arc_by_time(time)
         if arc.size == 0:
             return None, None, None
 
-        imgs = self.get_image(image_key)
+        imgs = get_image(image_key)
         if imgs is None:
             return None, None, None
         if frame_num is not None:
@@ -168,14 +272,15 @@ class ImageController(object):
             )
             spectra.append(values_by_img)
 
-        exposure = self.get_exposure(image_key)
+        exposure = get_exposure(image_key)
         times = exposure * np.arange(len(imgs)) + time
 
         intensities = np.nanmean(imgs, axis=(1, 2))
 
         # We only set the spectra if we extracted all
         if frame_num is None:
-            self.model().set_spectra(image_key, spectra)
+            with self._writing():
+                self.model().set_spectra(image_key, spectra)
         return spectra, times, intensities
 
 
@@ -450,32 +555,75 @@ class EvaluationController(ImageController):
             return
         evm.bounds_fwhm = bounds
 
+    # The run the last call of evaluate made (bmlab.evaluation_run).
+    # `last_run.outcome` tells how it ended, `last_run.run_id` is its
+    # number on the session.
+    last_run = None
+
     def evaluate(self, abort=None, count=None, max_count=None):
+        """
+        Evaluate the current repetition.
+
+        Every call is a run with an identity (see bmlab.evaluation_run).
+        A run which was replaced by a newer run, on this or another
+        controller of the session, stops without writing anything more
+        and returns like a cancelled run (max_count -1). Setting the
+        abort input stops a run, too. Use `last_run.outcome` to tell
+        the cases apart.
+        """
+        run = evaluation_runs(self.session).begin()
+        self._run = run
+        self.last_run = run
+        try:
+            # Measurement metadata is read once and used for the whole
+            # run. It is private to this run and dropped on every way
+            # out.
+            try:
+                self._snapshot = EvaluationSnapshot(self.session)
+            except ValueError:
+                self._snapshot = None
+                run.outcome = 'not-started'
+                if max_count is not None:
+                    max_count.value = -1
+                return
+            run.outcome = self._evaluate_run(abort, count, max_count)
+        except RunSuperseded:
+            run.outcome = 'superseded'
+            if max_count is not None:
+                max_count.value = -1
+        except BaseException:
+            run.outcome = 'failed'
+            raise
+        finally:
+            self._snapshot = None
+            self._run = None
+
+    def _evaluate_run(self, abort, count, max_count):
         em = self.session.extraction_model()
         if not em:
             if max_count is not None:
                 max_count.value = -1
-            return
+            return 'not-started'
 
         cm = self.session.calibration_model()
         if not cm:
             if max_count is not None:
                 max_count.value = -1
-            return
+            return 'not-started'
 
         pm = self.session.peak_selection_model()
         if not pm:
             if max_count is not None:
                 max_count.value = -1
-            return
+            return 'not-started'
 
         evm = self.session.evaluation_model()
         if not evm:
             if max_count is not None:
                 max_count.value = -1
-            return
+            return 'not-started'
 
-        image_keys = self.session.get_image_keys(True)
+        image_keys = self._snapshot.image_keys
 
         if max_count is not None:
             max_count.value = len(image_keys)
@@ -483,7 +631,7 @@ class EvaluationController(ImageController):
         brillouin_regions = pm.get_brillouin_regions()
         rayleigh_regions = pm.get_rayleigh_regions()
 
-        resolution = self.session.get_payload_resolution()
+        resolution = self._snapshot.resolution
 
         # Get first spectrum to find number of images
         spectra, _, _ = self.extract_spectra('0')
@@ -491,339 +639,310 @@ class EvaluationController(ImageController):
         if not spectra:
             if max_count is not None:
                 max_count.value = -1
-            return
+            return 'not-started'
 
         # We create a variable for this value here,
         # so changing nr_brillouin_peaks during evaluation
         # does not create issues
         nr_brillouin_peaks = evm.nr_brillouin_peaks
-        evm.initialize_results_arrays({
-            # measurement points in x direction
-            'dim_x': resolution[0],
-            # measurement points in y direction
-            'dim_y': resolution[1],
-            # measurement points in z direction
-            'dim_z': resolution[2],
-            # number of images per measurement point
-            'nr_images': len(spectra),
-            # number of Brillouin regions
-            'nr_brillouin_regions': len(brillouin_regions),
-            # number of peaks to fit per region
-            'nr_brillouin_peaks': nr_brillouin_peaks,
-            # number of Rayleigh regions
-            'nr_rayleigh_regions': len(rayleigh_regions),
-        })
+        # The settings of the fits are also snapshotted once per run.
+        fit_settings = PointFitSettings.snapshot(
+            nr_brillouin_peaks, brillouin_regions, rayleigh_regions,
+            evm.bounds_w0, evm.bounds_fwhm)
+        execution = self._fit_execution
+        if execution is None:
+            # Automatic: small jobs run in this process
+            execution = parallel_fit.select_execution(
+                len(image_keys), len(spectra),
+                len(brillouin_regions) + len(rayleigh_regions),
+                nr_brillouin_peaks)
 
+        # The workers start before the result arrays are initialised.
+        # The time and exposure of a point are read just before its
+        # extraction, so the first points go out as soon as possible.
+        pool = None
+        pool_started_at = time.perf_counter()
+        if execution.parallel:
+            pool = self._start_pool(execution)
+            if pool is None:
+                execution = parallel_fit.serial_execution()
+        try:
+            with self._writing():
+                evm.initialize_results_arrays({
+                    # measurement points in x direction
+                    'dim_x': resolution[0],
+                    # measurement points in y direction
+                    'dim_y': resolution[1],
+                    # measurement points in z direction
+                    'dim_z': resolution[2],
+                    # number of images per measurement point
+                    'nr_images': len(spectra),
+                    # number of Brillouin regions
+                    'nr_brillouin_regions': len(brillouin_regions),
+                    # number of peaks to fit per region
+                    'nr_brillouin_peaks': nr_brillouin_peaks,
+                    # number of Rayleigh regions
+                    'nr_rayleigh_regions': len(rayleigh_regions),
+                })
+        except BaseException:
+            # No work was sent. No worker process may stay.
+            self._stop_pool(pool)
+            raise
+
+        if pool is not None:
+            # The call owns the pool from here on and ends it
+            aborted = self._fit_points_parallel(
+                execution, pool, pool_started_at, image_keys, resolution,
+                cm, evm,
+                fit_settings, len(spectra), len(rayleigh_regions),
+                abort, count)
+        else:
+            aborted = self._fit_points_serial(
+                image_keys, resolution, cm, evm, fit_settings,
+                len(spectra), len(rayleigh_regions), abort, count)
+        if aborted:
+            with self._writing():
+                calculate_derived_values()
+            if max_count is not None:
+                max_count.value = -1
+            return 'cancelled'
+
+        with self._writing():
+            calculate_derived_values()
+
+        return 'completed'
+
+    def _start_pool(self, execution):
+        """
+        Start the workers. Returns the pool, or None if the workers
+        cannot start. Nothing was submitted, extracted or stored yet,
+        so the run then goes on in this process and gives exactly the
+        serial results. (Failures after work was submitted are not
+        handled this way, see `_fit_points_parallel`.)
+        """
+        try:
+            return execution.create_pool()
+        except Exception as error:
+            logger.warning(
+                'Could not start worker processes (%s: %s). '
+                'Evaluating in this process instead.',
+                type(error).__name__, error, exc_info=True)
+            return None
+
+    @staticmethod
+    def _stop_pool(pool):
+        """Stop a pool whose work is not needed. Leaves no worker."""
+        if pool is None:
+            return
+        try:
+            pool.terminate()
+        finally:
+            pool.join()
+
+    # Internal setting of how the fits are executed (None: defaults),
+    # see bmlab.parallel_fit.FitExecution. Not a user setting.
+    _fit_execution = None
+
+    def _prepare_point(self, cm, evm, image_key, ind):
+        """
+        Extract the spectra of a point in the controlling process and
+        store everything which does not need a fit.
+
+        Returns (spectra, frequencies), or None if there is nothing to fit.
+        """
+        ind_x, ind_y, ind_z = ind
+        spectra, times, intensities = self.extract_spectra(image_key)
+        if spectra is None:
+            return None
+        with self._writing():
+            evm.results['time'][ind_x, ind_y, ind_z, :, 0, 0] = times
+            evm.results['intensity'][ind_x, ind_y, ind_z, :, 0, 0] = \
+                intensities
+
+        frequencies = cm.get_frequencies_by_time(times)
+        # If we don't have frequency axis, we cannot evaluate on it
+        if frequencies is None:
+            return None
+        frequencies = list(frequencies)
+        with self._writing():
+            evm.set_frequencies(image_key, frequencies)
+        return spectra, frequencies
+
+    @staticmethod
+    def _store_point(evm, ind, nr_frames, point_results,
+                     rayleigh_peak_initial):
+        """
+        Write the fit results of a point and calculate the shift of the
+        Rayleigh peaks. Points must be stored in measurement order.
+
+        Returns the (possibly new) reference Rayleigh peak positions.
+        """
+        ind_x, ind_y, ind_z = ind
+        for key, values in point_results.items():
+            evm.results[key][ind_x, ind_y, ind_z, :nr_frames] = values
+
+        # Calculate the shift of the Rayleigh peaks,
+        # in order to follow the peaks in case of a drift
+        rayleigh_peak_current = evm.results['rayleigh_peak_position_f'][
+                ind_x, ind_y, ind_z, :, :, :]
+        # If we haven't found a valid Rayleigh peak position,
+        # but the current one is valid, use it
+        if not np.isnan(rayleigh_peak_current).all()\
+                and np.isnan(rayleigh_peak_initial).all():
+            rayleigh_peak_initial = rayleigh_peak_current
+        shift = rayleigh_peak_current - rayleigh_peak_initial
+        evm.results['rayleigh_shift'][ind_x, ind_y, ind_z, :, :, :] = shift
+        return rayleigh_peak_initial
+
+    def _store_and_calculate(self, evm, ind, idx, nr_frames, point_results,
+                             rayleigh_peak_initial, stored):
+        """
+        Store the results of a point (see `_store_point`). Every ten steps
+        calculate the derived values of the points `stored` since the
+        last time and empty `stored`.
+
+        Returns the (possibly new) reference Rayleigh peak positions.
+        """
+        with self._writing():
+            rayleigh_peak_initial = self._store_point(
+                evm, ind, nr_frames, point_results, rayleigh_peak_initial)
+            stored.append(ind)
+            if not (idx % 10):
+                calculate_derived_values(stored)
+                stored.clear()
+        return rayleigh_peak_initial
+
+    def _fit_points_serial(self, image_keys, resolution, cm, evm,
+                           fit_settings, nr_frames, nr_rayleigh_regions,
+                           abort, count):
+        """
+        Fit all points one after the other in this process.
+        Returns True if the evaluation was aborted.
+        """
         # Initialize the Rayleigh shift
         # used for compensating drifts
         rayleigh_peak_initial =\
-            np.nan * np.ones((len(spectra), len(rayleigh_regions), 1))
+            np.nan * np.ones((nr_frames, nr_rayleigh_regions, 1))
+        # Points stored since the derived values were calculated
+        stored = []
         # Loop over all measurement positions
         for idx, image_key in enumerate(image_keys):
+
+            # A run which a newer run has replaced does nothing more
+            if self._run is not None:
+                self._run.ensure_current()
 
             if count is not None:
                 count.value += 1
 
             # Calculate the indices for the given key
-            (ind_x, ind_y, ind_z) =\
-                self.get_indices_from_key(resolution, image_key)
+            ind = self.get_indices_from_key(resolution, image_key)
 
             if (abort is not None) and abort.value:
-                calculate_derived_values()
-                if max_count is not None:
-                    max_count.value = -1
-                return
-            spectra, times, intensities =\
-                self.extract_spectra(image_key)
-            if spectra is None:
+                return True
+            prepared = self._prepare_point(cm, evm, image_key, ind)
+            if prepared is None:
                 continue
-            evm.results['time'][ind_x, ind_y, ind_z, :, 0, 0] =\
-                times
-            evm.results['intensity'][ind_x, ind_y, ind_z, :, 0, 0] =\
-                intensities
+            spectra, frequencies = prepared
 
-            frequencies = cm.get_frequencies_by_time(times)
-            # If we don't have frequency axis, we cannot evaluate on it
-            if frequencies is None:
-                continue
-            frequencies = list(frequencies)
-            evm.set_frequencies(image_key, frequencies)
+            # All fits of a point (single-peak fits, bounds depending
+            # on the Rayleigh peaks, multi-peak fits) are done together.
+            point_results = fit_point(spectra, frequencies, fit_settings)
+            rayleigh_peak_initial = self._store_and_calculate(
+                evm, ind, idx, len(spectra), point_results,
+                rayleigh_peak_initial, stored)
+        return False
 
-            for region_key, region in enumerate(brillouin_regions):
-                results = self.fit_spectra(spectra, frequencies, region)
-                for frame_num, _ in enumerate(spectra):
-                    ind = (ind_x, ind_y, ind_z,
-                           frame_num, region_key, 0)
-                    evm.results['brillouin_peak_position_f'][ind] =\
-                        results[frame_num][0]
-                    evm.results['brillouin_peak_fwhm_f'][ind] =\
-                        results[frame_num][1]
-                    evm.results['brillouin_peak_intensity'][ind] =\
-                        results[frame_num][2]
-                    evm.results['brillouin_peak_offset'][ind] =\
-                        results[frame_num][3]
+    def _fit_points_parallel(self, execution, pool, pool_started_at,
+                             image_keys, resolution, cm, evm, fit_settings,
+                             nr_frames, nr_rayleigh_regions, abort, count):
+        """
+        Fit points in batches in worker processes. This process
+        extracts the spectra and stores the results in measurement order
+        as soon as the points up to them are complete. Workers only get
+        arrays and the fit settings.
+        The pool belongs to this call. It is closed or terminated before
+        the call returns.
+        Returns True if the evaluation was aborted.
+        """
+        rayleigh_peak_initial =\
+            np.nan * np.ones((nr_frames, nr_rayleigh_regions, 1))
+        # Points stored since the derived values were calculated
+        stored = []
 
-            for region_key, region in enumerate(rayleigh_regions,):
-                results = self.fit_spectra(spectra, frequencies, region)
-                for frame_num, _ in enumerate(spectra):
-                    ind = (ind_x, ind_y, ind_z, frame_num,
-                           region_key - len(brillouin_regions))
-                    evm.results['rayleigh_peak_position_f'][ind] =\
-                        results[frame_num][0]
-                    evm.results['rayleigh_peak_fwhm_f'][ind] =\
-                        results[frame_num][1]
-                    evm.results['rayleigh_peak_intensity'][ind] =\
-                        results[frame_num][2]
-                    evm.results['rayleigh_peak_offset'][ind] =\
-                        results[frame_num][3]
+        def points():
+            for idx, image_key in enumerate(image_keys):
+                ind = self.get_indices_from_key(resolution, image_key)
+                prepared = self._prepare_point(cm, evm, image_key, ind)
+                if prepared is None:
+                    yield (idx, ind, 0), None
+                else:
+                    yield (idx, ind, len(prepared[0])), prepared
 
-            # We can only do a multi-peak fit after the single-peak
-            # Rayleigh fit is done, because we have to know the
-            # Rayleigh peak positions in GHz in order to convert
-            # the multi-peak fit bounds given in GHz into the position
-            # in pixels.
-            if nr_brillouin_peaks > 1:
-                ind =\
-                    (ind_x, ind_y, ind_z, slice(None), slice(None), 0)
-                rayleigh_peaks = np.transpose(
-                    evm.results['rayleigh_peak_position_f'][ind]
-                )
-                bounds_w0 = self.create_bounds(
-                    brillouin_regions,
-                    rayleigh_peaks
-                )
-                bounds_fwhm = self.create_bounds_fwhm(
-                    brillouin_regions,
-                    rayleigh_peaks
-                )
+        def should_abort():
+            # Raises if a newer run has replaced this one
+            if self._run is not None:
+                self._run.ensure_current()
+            return (abort is not None) and abort.value
 
-                for region_key, region in enumerate(
-                        brillouin_regions):
-                    results_multi_peak\
-                        = self.fit_spectra(spectra,
-                                           frequencies,
-                                           region,
-                                           nr_brillouin_peaks,
-                                           bounds_w0[region_key],
-                                           bounds_fwhm[region_key])
-                    for frame_num, spectrum in enumerate(spectra):
-                        ind = (ind_x, ind_y, ind_z,
-                               frame_num, region_key,
-                               slice(1, nr_brillouin_peaks+1))
-                        evm.results[
-                            'brillouin_peak_position_f'][ind] = \
-                            results_multi_peak[frame_num][0]
-                        evm.results[
-                            'brillouin_peak_fwhm_f'][ind] = \
-                            results_multi_peak[frame_num][1]
-                        evm.results[
-                            'brillouin_peak_intensity'][ind] = \
-                            results_multi_peak[frame_num][2]
-                        evm.results[
-                            'brillouin_peak_offset'][ind] = \
-                            results_multi_peak[frame_num][3]
-
-            # Calculate the shift of the Rayleigh peaks,
-            # in order to follow the peaks in case of a drift
-            rayleigh_peak_current = evm.results['rayleigh_peak_position_f'][
-                    ind_x, ind_y, ind_z, :, :, :]
-            # If we haven't found a valid Rayleigh peak position,
-            # but the current one is valid, use it
-            if not np.isnan(rayleigh_peak_current).all()\
-                    and np.isnan(rayleigh_peak_initial).all():
-                rayleigh_peak_initial = rayleigh_peak_current
-            shift = rayleigh_peak_current - rayleigh_peak_initial
-            evm.results['rayleigh_shift'][ind_x, ind_y, ind_z, :, :, :] = shift
-
-            # Calculate the derived values every ten steps
-            if not (idx % 10):
-                calculate_derived_values()
-
-        calculate_derived_values()
-
-        return
+        finished = False
+        runner = None
+        try:
+            runner = parallel_fit.OrderedBatchRunner(
+                pool, fit_settings, execution.batch_size,
+                execution.max_outstanding_jobs, should_abort,
+                execution.job_timeout)
+            for (idx, ind, nr_spectra), point_results in runner.run(points()):
+                if count is not None:
+                    count.value += 1
+                if point_results is None:
+                    continue
+                rayleigh_peak_initial = self._store_and_calculate(
+                    evm, ind, idx, nr_spectra, point_results,
+                    rayleigh_peak_initial, stored)
+            finished = not runner.aborted
+        finally:
+            if runner is not None and self._run is not None:
+                self._run.stats = runner.statistics(
+                    execution.workers, pool_started_at)
+            # The pool is per run. After normal completion the workers
+            # have no work left and exit. Otherwise (abort, failure)
+            # unfinished work is dropped. No worker survives the run.
+            try:
+                if finished:
+                    pool.close()
+                else:
+                    pool.terminate()
+            finally:
+                pool.join()
+        return runner.aborted
 
     @staticmethod
     def fit_spectra(spectra, frequencies, region, nr_peaks=1,
                     bounds_w0=None, bounds_fwhm=None):
-        fits = []
-        for frame_num, spectrum in enumerate(spectra):
-            if bounds_w0 is None and bounds_fwhm is None:
-                fit = fit_lorentz_region(
-                    region,
-                    frequencies[frame_num],
-                    spectrum,
-                    nr_peaks
-                )
-            elif bounds_fwhm is None:
-                fit = fit_lorentz_region(
-                    region,
-                    frequencies[frame_num],
-                    spectrum,
-                    nr_peaks,
-                    bounds_w0[frame_num]
-                )
-            else:
-                fit = fit_lorentz_region(
-                    region,
-                    frequencies[frame_num],
-                    spectrum,
-                    nr_peaks,
-                    bounds_w0[frame_num],
-                    bounds_fwhm[frame_num]
-                )
-            fits.append(fit)
-        return fits
+        return point_fit.fit_spectra(
+            spectra, frequencies, region, nr_peaks,
+            bounds_w0, bounds_fwhm)
 
     def create_bounds(self, brillouin_regions, rayleigh_peaks):
         """
         This function converts the bounds settings into
-        a bounds object for the fitting function
-        Allowed parameters for the bounds settings are
-        - 'min'/'max'   -> Will be converted to the respective
-            lower or upper limit of the given region
-        - '-Inf', 'Inf' -> Will be converted to -np.inf or np.inf
-        - number [GHz]  -> Will be converted into the pixel
-            position of the given frequency
-        Parameters
-        ----------
-        brillouin_regions
-        rayleigh_peaks
-
-        Returns
-        -------
-
+        a bounds object for the fitting function,
+        see bmlab.point_fit.create_bounds.
         """
         evm = self.session.evaluation_model()
-        bounds = evm.bounds_w0
-        if bounds is None:
-            return None
-
-        # We need two Rayleigh peak positions to determine the FSR
-        # and decide whether a peak is Stokes or Anti-Stokes
-        if rayleigh_peaks.shape[0] != 2:
-            return None
-
-        w0_bounds = []
-        # We have to create a separate bound for every region
-        for region_idx, region in enumerate(brillouin_regions):
-            local_time = []
-            for rayleigh_idx in range(rayleigh_peaks.shape[1]):
-                anti_stokes_limit = np.nanmean(rayleigh_peaks[:, rayleigh_idx])
-                # We need to figure out, whether a peak is a
-                # Stokes or Anti-Stokes peak in order to decide
-                # to which Rayleigh peak we need to relate to.
-                tmp = region >= anti_stokes_limit
-                is_pure_region = (tmp == tmp[0]).all()
-
-                is_anti_stokes_region = np.mean(region) >\
-                    anti_stokes_limit
-
-                local_bound = []
-                for bound in bounds:
-                    parsed_bound = []
-                    for limit in bound:
-                        try:
-                            parsed_bound.append(float(limit))
-                        except ValueError:
-                            parsed_bound.append(np.nan)
-                    # We don't treat Inf as a value
-                    with warnings.catch_warnings():
-                        warnings.filterwarnings(
-                            action='ignore',
-                            message='Mean of empty slice'
-                        )
-                        is_anti_stokes_peak =\
-                            np.nanmean(
-                                np.array(parsed_bound)[
-                                    np.isfinite(parsed_bound)]
-                            ) < 0
-
-                    is_anti_stokes = is_anti_stokes_region if\
-                        is_pure_region else is_anti_stokes_peak
-
-                    local_limit = []
-                    for limit in bound:
-                        if limit.lower() == 'min':
-                            val = region[int(is_anti_stokes)]
-                            # print(val)
-                        elif limit.lower() == 'max':
-                            val = region[int(not is_anti_stokes)]
-                        elif limit.lower() == '-inf':
-                            val = -((-1) ** is_anti_stokes)\
-                                          * np.inf
-                        elif limit.lower() == 'inf':
-                            val = ((-1) ** is_anti_stokes)\
-                                          * np.inf
-                        else:
-                            # Try to convert the value in GHz into
-                            # a value in pixel depending on the time
-                            try:
-                                val = ((-1) ** is_anti_stokes)\
-                                          * 1e9 * abs(float(limit))\
-                                          + rayleigh_peaks[
-                                          int(is_anti_stokes), rayleigh_idx]
-                            except BaseException:
-                                val = np.inf
-                        local_limit.append(val)
-                    # Check that the bounds are sorted ascendingly
-                    # (for anti-stokes, they might not).
-                    local_limit.sort()
-                    local_bound.append(local_limit)
-                local_time.append(local_bound)
-            w0_bounds.append(local_time)
-
-        return w0_bounds
+        return point_fit.create_bounds(
+            evm.bounds_w0, brillouin_regions, rayleigh_peaks)
 
     def create_bounds_fwhm(self, brillouin_regions, rayleigh_peaks):
         """
         This function converts the fwhm bounds settings into
-        a fwhm bounds object for the fitting function
-        Allowed parameters for the bounds settings are
-        - 'min'/'max'   -> Will be converted to 0/np.inf
-        - '-Inf', 'Inf' -> Will be converted to 0 or np.inf
-        - number [GHz]  -> Will be converted into the value in Hz
-        Parameters
-        ----------
-        brillouin_regions
-        rayleigh_peaks
-
-        Returns
-        -------
-
+        a fwhm bounds object for the fitting function,
+        see bmlab.point_fit.create_bounds_fwhm.
         """
         evm = self.session.evaluation_model()
-        bounds_fwhm = evm.bounds_fwhm
-        if bounds_fwhm is None:
-            return None
-
-        fwhm_bounds = []
-        # We have to create a separate bound for every region
-        for region_idx, _ in enumerate(brillouin_regions):
-            region_bound = []
-            for rayleigh_idx in range(rayleigh_peaks.shape[1]):
-                peak_bound = []
-                for bound in bounds_fwhm:
-                    local_bound = []
-                    for limit in bound:
-                        if limit.lower() == 'min':
-                            val = 0
-                        elif limit.lower() == '-inf':
-                            val = 0
-                        elif limit.lower() == 'max':
-                            val = np.inf
-                        elif limit.lower() == 'inf':
-                            val = np.inf
-                        else:
-                            try:
-                                val = 1e9*abs(float(limit))
-                            except ValueError:
-                                val = np.inf
-                        local_bound.append(val)
-                    peak_bound.append(local_bound)
-                region_bound.append(peak_bound)
-            fwhm_bounds.append(region_bound)
-        return fwhm_bounds
+        return point_fit.create_bounds_fwhm(
+            evm.bounds_fwhm, brillouin_regions, rayleigh_peaks)
 
     def get_data(self, parameter_key, brillouin_peak_index=0):
         """
@@ -961,9 +1080,53 @@ class EvaluationController(ImageController):
         return ind_x, ind_y, ind_z
 
 
-def calculate_derived_values():
+def _brillouin_shift(brillouin_peak_position_f, rayleigh_peak_position_f):
     """
-    We calculate the Brillouin shift in GHz here
+    The Brillouin shift in GHz of the given points. The values of a point
+    only depend on the peak positions of this point, so the arrays can
+    hold all points (x, y, z, frames, regions, peaks) or a selection of
+    points (n, frames, regions, peaks). Returns an array without the
+    peaks of the Rayleigh regions.
+    """
+    shape_brillouin = brillouin_peak_position_f.shape
+    shape_rayleigh = rayleigh_peak_position_f.shape
+
+    # We calculate every possible combination of
+    # Brillouin peak and Rayleigh peak position difference
+    # and then use the smallest absolute value.
+    # That saves us from sorting Rayleigh peaks to Brillouin peaks,
+    # because a Brillouin peak always belongs to the Rayleigh peak nearest.
+    brillouin_shift_f = np.nan * np.ones(
+        (*shape_brillouin, shape_rayleigh[-2]))
+    for idx in range(shape_rayleigh[-2]):
+        brillouin_shift_f[..., idx] = abs(
+            brillouin_peak_position_f -
+            np.tile(
+                rayleigh_peak_position_f[..., [idx], :],
+                (*([1] * (len(shape_brillouin) - 1)), shape_brillouin[-1])
+            )
+        )
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            action='ignore',
+            message='All-NaN slice encountered'
+        )
+        return np.nanmin(brillouin_shift_f, -1)
+
+
+def calculate_derived_values(points=None):
+    """
+    We calculate the Brillouin shift in GHz here.
+
+    Parameters
+    ----------
+    points: list of (ind_x, ind_y, ind_z) or None
+        Calculate the values of these points only and keep the values of
+        all other points. This costs time proportional to the number of
+        points given, not to the size of the scan. The values are the
+        same as the ones a calculation for all points gives.
+        None calculates all points.
     """
     session = Session.get_instance()
     evm = session.evaluation_model()
@@ -976,30 +1139,21 @@ def calculate_derived_values():
     if evm.results['rayleigh_peak_position_f'].size == 0:
         return
 
-    shape_brillouin = evm.results['brillouin_peak_position_f'].shape
-    shape_rayleigh = evm.results['rayleigh_peak_position_f'].shape
+    brillouin = evm.results['brillouin_peak_position_f']
+    rayleigh = evm.results['rayleigh_peak_position_f']
 
-    # We calculate every possible combination of
-    # Brillouin peak and Rayleigh peak position difference
-    # and then use the smallest absolute value.
-    # That saves us from sorting Rayleigh peaks to Brillouin peaks,
-    # because a Brillouin peak always belongs to the Rayleigh peak nearest.
-    brillouin_shift_f = np.nan * np.ones((*shape_brillouin, shape_rayleigh[4]))
-    for idx in range(shape_rayleigh[4]):
-        brillouin_shift_f[:, :, :, :, :, :, idx] = abs(
-            evm.results['brillouin_peak_position_f'] -
-            np.tile(
-                evm.results['rayleigh_peak_position_f'][:, :, :, :, [idx], :],
-                (1, 1, 1, 1, 1, shape_brillouin[5])
-            )
-        )
+    shift = evm.results.get('brillouin_shift_f')
+    if points is None or shift is None \
+            or shift.shape != brillouin.shape:
+        evm.results['brillouin_shift_f'] = _brillouin_shift(
+            brillouin, rayleigh)
+        return
 
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            action='ignore',
-            message='All-NaN slice encountered'
-        )
-        evm.results['brillouin_shift_f'] = np.nanmin(brillouin_shift_f, 6)
+    if not len(points):
+        return
+    ind_x, ind_y, ind_z = np.asarray(points, dtype=int).T
+    shift[ind_x, ind_y, ind_z] = _brillouin_shift(
+        brillouin[ind_x, ind_y, ind_z], rayleigh[ind_x, ind_y, ind_z])
 
 
 class Controller(object):

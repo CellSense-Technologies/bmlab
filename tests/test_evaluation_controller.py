@@ -1,10 +1,18 @@
 import pathlib
+import shutil
+
+import h5py
 import numpy as np
 
 import pytest
 
-from bmlab.controllers import EvaluationController, calculate_derived_values
-from bmlab.models import CalibrationModel, EvaluationModel
+from bmlab.controllers import EvaluationController, EvaluationSnapshot, \
+    ImageController, ExtractionController, CalibrationController, \
+    PeakSelectionController, calculate_derived_values
+from bmlab.file import BrillouinFile, Payload
+from bmlab.models import CalibrationModel, EvaluationModel, Orientation
+from bmlab.models.setup import AVAILABLE_SETUPS
+from bmlab.session import Session
 
 
 def data_file_path(file_name):
@@ -759,3 +767,276 @@ def test_create_bounds_fwhm(mocker):
             [[0, 0.9e9], [2.0e9, np.inf], [0, np.inf]]
         ]
     ], fit_bounds_fwhm, atol=1e6)
+
+
+# ---------------------------------------------------------------------------
+# Per-run metadata snapshot
+# ---------------------------------------------------------------------------
+
+BRILLOUIN_REGIONS = [(4.0e9, 6.0e9), (9.0e9, 11.0e9)]
+RAYLEIGH_REGIONS = [(-2.0e9, 2.0e9), (13.0e9, 17.0e9)]
+
+
+def prepare_evaluation(file_name='Water.h5', nr_brillouin_peaks=1,
+                       repetition='0'):
+    """
+    Load a file into the session, run extraction and calibration,
+    and select the evaluation settings. Returns the EvaluationController.
+    """
+    session = Session.get_instance()
+    session.set_file(data_file_path(file_name))
+    session.set_current_repetition(repetition)
+    session.set_setup(AVAILABLE_SETUPS[0])
+    session.orientation = Orientation(rotation=1, reflection={
+        'vertically': False, 'horizontally': False})
+
+    ExtractionController().find_points_all()
+    cc = CalibrationController()
+    for calib_key in session.get_calib_keys():
+        cc.find_peaks(calib_key)
+        cc.calibrate(calib_key)
+
+    psc = PeakSelectionController()
+    for region in BRILLOUIN_REGIONS:
+        psc.add_brillouin_region_frequency(region)
+    for region in RAYLEIGH_REGIONS:
+        psc.add_rayleigh_region_frequency(region)
+
+    evc = EvaluationController()
+    evc.set_nr_brillouin_peaks(nr_brillouin_peaks)
+    return evc
+
+
+def copy_results(evc):
+    evm = evc.session.evaluation_model()
+    return {key: np.array(value) for key, value in evm.results.items()}
+
+
+def assert_results_equal(actual, expected):
+    assert set(actual) == set(expected)
+    for key in expected:
+        np.testing.assert_array_equal(
+            actual[key], expected[key], err_msg=key)
+
+
+def copy_positions(session):
+    return {axis: np.array(values) for axis, values
+            in session.get_payload_positions().items()}
+
+
+@pytest.mark.parametrize('nr_brillouin_peaks', [1, 2])
+def test_evaluate_results_equal_pre_snapshot_serial_output(
+        nr_brillouin_peaks):
+    # The reference was created with the evaluation code before
+    # the metadata snapshot was introduced (bmlab 0.12.3).
+    evc = prepare_evaluation(nr_brillouin_peaks=nr_brillouin_peaks)
+    evc.evaluate()
+
+    with np.load(data_file_path(
+            'Water.evaluation_reference_{}_peak.npz'
+            .format(nr_brillouin_peaks))) as reference:
+        expected = {key: reference[key] for key in reference.files}
+    assert_results_equal(copy_results(evc), expected)
+
+
+def test_evaluate_reads_metadata_once_per_run(mocker):
+    evc = prepare_evaluation()
+    nr_points = len(evc.session.get_image_keys())
+    spy_time = mocker.spy(Payload, 'get_time')
+    spy_exposure = mocker.spy(Payload, 'get_exposure')
+    spy_repetition = mocker.spy(BrillouinFile, 'get_repetition')
+
+    evc.evaluate()
+
+    # Time and exposure are read once per measurement point, not
+    # once per use, although the first point is extracted twice.
+    assert spy_time.call_count == nr_points
+    assert spy_exposure.call_count == nr_points
+    # A single repetition wrapper serves the whole run.
+    assert spy_repetition.call_count == 1
+
+
+@pytest.fixture
+def two_repetition_file(tmp_path):
+    """
+    Copy of Water.h5 with a second repetition that has a different
+    exposure time and therefore different frame times.
+    """
+    path = tmp_path / 'Water2.h5'
+    shutil.copy(data_file_path('Water.h5'), path)
+    with h5py.File(path, 'r+') as f:
+        f.copy('Brillouin/0', f['Brillouin'], name='1')
+        data = f['Brillouin/1/payload/data']
+        for key in data.keys():
+            data[key].attrs['exposure'] = np.array([2.0])
+    return path
+
+
+def test_evaluate_uses_newly_selected_repetition(two_repetition_file):
+    session = Session.get_instance()
+    session.set_file(two_repetition_file)
+    assert session.file.repetition_keys() == ['0', '1']
+    session.set_setup(AVAILABLE_SETUPS[0])
+    session.orientation = Orientation(rotation=1, reflection={
+        'vertically': False, 'horizontally': False})
+
+    results = {}
+    evc = EvaluationController()
+    for repetition in ['0', '1', '0']:
+        session.set_current_repetition(repetition)
+        ExtractionController().find_points_all()
+        cc = CalibrationController()
+        for calib_key in session.get_calib_keys():
+            cc.find_peaks(calib_key)
+            cc.calibrate(calib_key)
+        psc = PeakSelectionController()
+        psm = session.peak_selection_model()
+        if not psm.get_brillouin_regions():
+            for region in BRILLOUIN_REGIONS:
+                psc.add_brillouin_region_frequency(region)
+            for region in RAYLEIGH_REGIONS:
+                psc.add_rayleigh_region_frequency(region)
+        evc.evaluate()
+        results.setdefault(repetition, []).append(copy_results(evc))
+
+    times_0 = results['0'][0]['time']
+    times_1 = results['1'][0]['time']
+    # Same measurement times, different exposure for the second frame.
+    np.testing.assert_allclose(times_0[..., 0, 0, 0],
+                               times_1[..., 0, 0, 0])
+    np.testing.assert_allclose(
+        times_0[..., 1, 0, 0] - times_0[..., 0, 0, 0], 0.5)
+    np.testing.assert_allclose(
+        times_1[..., 1, 0, 0] - times_1[..., 0, 0, 0], 2.0)
+    # Evaluating repetition 0 again reproduces its first result.
+    assert_results_equal(results['0'][1], results['0'][0])
+
+
+def evaluate_saved_session(file_name):
+    """ Evaluate a file together with its saved session """
+    session = Session.get_instance()
+    session.set_file(data_file_path(file_name))
+    session.set_current_repetition('0')
+    evc = EvaluationController()
+    evc.evaluate()
+    return copy_results(evc)
+
+
+def test_evaluate_after_switching_file_uses_new_measurement():
+    # Evaluate 3D.h5 alone as the reference
+    Session.get_instance().clear()
+    reference_3d = evaluate_saved_session('3D.h5')
+    assert reference_3d['time'].shape[:3] == (3, 5, 7)
+
+    # Evaluate a different file in between
+    evc = prepare_evaluation('Water.h5')
+    evc.evaluate()
+    water = copy_results(evc)
+    assert water['time'].shape[:3] == (10, 1, 1)
+
+    # The new file gives exactly the results of the reference
+    # and nothing from the file evaluated before.
+    switched_3d = evaluate_saved_session('3D.h5')
+    assert_results_equal(switched_3d, reference_3d)
+
+    # Switching back gives the results of the first file again.
+    evc = prepare_evaluation('Water.h5')
+    evc.evaluate()
+    assert_results_equal(copy_results(evc), water)
+
+
+def test_evaluate_keeps_positions_unchanged():
+    evc = prepare_evaluation()
+    session = evc.session
+    positions_before = copy_positions(session)
+
+    evc.evaluate()
+    assert_results_equal(
+        copy_positions(session), positions_before)
+
+    # The GUI reads positions for plotting after every run.
+    evc.get_data('brillouin_shift_f')
+    evc.evaluate()
+    evc.get_data('brillouin_shift_f')
+    evc.evaluate()
+    assert_results_equal(
+        copy_positions(session), positions_before)
+
+    _, positions, _, _ = evc.get_data('brillouin_shift_f')
+    for axis, values in zip('xyz', positions):
+        np.testing.assert_array_equal(values, positions_before[axis])
+
+
+def test_evaluate_results_equal_across_repeated_runs():
+    evc = prepare_evaluation()
+    evc.evaluate()
+    first = copy_results(evc)
+    evc.evaluate()
+    assert_results_equal(copy_results(evc), first)
+
+
+def test_snapshot_is_gone_after_normal_run():
+    evc = prepare_evaluation()
+    assert evc._snapshot is None
+    evc.evaluate()
+    assert evc._snapshot is None
+
+
+def test_snapshot_exists_during_run_and_is_private(mocker):
+    evc = prepare_evaluation()
+    seen = []
+    original = EvaluationController._evaluate_run
+
+    def spy(self, *args, **kwargs):
+        seen.append(self._snapshot)
+        return original(self, *args, **kwargs)
+
+    mocker.patch.object(EvaluationController, '_evaluate_run', spy)
+    evc.evaluate()
+    assert len(seen) == 1 and seen[0] is not None
+    # Other controllers never see the snapshot.
+    assert EvaluationController()._snapshot is None
+    assert ImageController._snapshot is None
+
+
+class _Flag:
+    def __init__(self, value):
+        self.value = value
+
+
+def test_snapshot_is_gone_after_aborted_run():
+    evc = prepare_evaluation()
+    abort = _Flag(True)
+    count = _Flag(0)
+    max_count = _Flag(0)
+    evc.evaluate(abort=abort, count=count, max_count=max_count)
+    assert max_count.value == -1
+    assert evc._snapshot is None
+
+
+def test_snapshot_is_gone_after_failing_run(mocker):
+    evc = prepare_evaluation()
+    mocker.patch(
+        'bmlab.controllers.fit_point',
+        side_effect=RuntimeError('boom'))
+    with pytest.raises(RuntimeError):
+        evc.evaluate()
+    assert evc._snapshot is None
+
+
+def test_snapshot_is_gone_after_snapshot_creation_fails(mocker):
+    evc = prepare_evaluation()
+    mocker.patch.object(
+        EvaluationSnapshot, '__init__', side_effect=OSError('broken'))
+    with pytest.raises(OSError):
+        evc.evaluate()
+    assert evc._snapshot is None
+
+
+def test_evaluate_without_file_leaves_no_snapshot():
+    Session.get_instance().clear()
+    evc = EvaluationController()
+    max_count = _Flag(0)
+    evc.evaluate(max_count=max_count)
+    assert max_count.value == -1
+    assert evc._snapshot is None
